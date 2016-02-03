@@ -1,0 +1,29 @@
+liste serveur HTTP
+	
+	Apache HTTP  ------------------->   Apache/x.x.x
+	Apache Tomcat ------------------>	Apache Tomcat/X.X.X
+	BusyBox httpd ------------------>	busybox httpd/X.X.X
+	IIS (Microsoft) ---------------->	Microsoft-IIS/X.X.X
+	lighttpd ----------------------->	lighttp/X.X.X
+	nginx -------------------------->	nginx/X.X.X
+	Sun Java System Web Server ----->	Sun-Java-System-Web-Server/X.X.X
+	Zeus Web Server ---------------->	Zeus/([0-9.]+[r0-9]*)
+	
+liste serveur FTP
+
+  FileZilla Server --------------->	FileZilla Server version X.X.X (X.X.X.X) (X.X.Xa)
+  vsftpd ------------------------->	(vsFTPd X.X.X)
+  proftpd ------------------------>	ProFTPD X.X.X.Xrc
+  pure-ftpd ---------------------->	
+	freeFTPd ----------------------->	WeOnlyDo-wodFTPD X.X.X.X
+	psftp -------------------------->
+
+liste serveur SSH
+
+	OpenSSH ------------------------>	OpenSSH_6.6.1p1
+	FRESH -------------------------->	
+	freeSSHd ----------------------->	WeOnlyDo-wodSSHD X.X.X.X
+	
+liste serveur DNS
+
+	BIND --------------------------->	fonction perso
