@@ -236,7 +236,9 @@ def syn(ip, ports):
 					# Kernel send RST to end connection
 					etat = 'open'
 					service = servFingerprinting2(reqIp.dst, resTcp.sport)
-					if service and resTcp.sport in [80, 8080, 8008, 8009, 8081, 8888]: cve = ''.join(*searchCVE(service.split('/')))
+					if service and not service.startswith('[') \
+					and resTcp.sport in [80, 8080, 8008, 8009, 8081, 8888]:
+						cve = ' '.join(searchCVE(*service.split('/')))
 				elif (resTcp.flags == 0x14):
 					etat = 'closed'
 				else:
@@ -596,11 +598,12 @@ def servFingerprinting2(dstIp, dstPort, sock=None): # TODO
 		except URLError as e:
 			if VERBOSE: print 'Status code:', e.code
 			if e.code < 500:
-				pass
-				#html = res.read()
-				#soup = BeautifulSoup.BeautifulSoup(html, "lxml")
+				serv = ''.join(e.info().getheaders('server')[:1])
+				if not serv:
+					html = res.read()
+					soup = BeautifulSoup(html, "lxml")
 				#TODO: parse
-			else:
+			if not serv:
 				serv = '[HTTP GET status {}]'.format(e.code)
 		except socket.timeout:
 			if VERBOSE: print 'timeout'
@@ -650,7 +653,7 @@ def servFingerprinting(dstIp, dstPort, sock=None): # TODO: faire un vrai fingerp
 	return liste
 
 
-def searchCVE(service,version):
+def searchCVE(service, version):
 	"""Return a list of strings"""
 	
 	url = "https://cve.mitre.org/cgi-bin/cvekey.cgi?keyword="+service+"+"+version
@@ -742,7 +745,7 @@ def toService(port, fingerprint='', fmt=True):
 # 1-1023: well-known, 1024-49151: vendor registered, 49152-65535: dynamic/private
 VERY_COMMON_PORTS = [20, 21, 22, 23, 53, 80, 443, 8000, 8080, 8433] # FTP, SSH, Telnet, DNS, HTTP, HTTPS, HTTP Proxy, HTTP-alt, HTTPS-alt
 OTHER_COMMON_PORTS = [81, 990, 1027, 3128, 8008, 8009, 8081, 8888, 32768, 32769] # HOSTS2, FTPS, IIS, Squid proxy, IBM HTTP, Apache JServ, various HTTP, Sun HTTP, IBM Filenet
-DATABASE_PORTS = [1433, 1521, 1528, 2483, 2484, 3050, 3306, 5432] # MySQL, PostgreSQL, MSSQL, Oracle
+DATABASE_PORTS = [1433, 1434, 1521, 1528, 2483, 2484, 3050, 3306, 5432] # MySQL, PostgreSQL, MSSQL, Oracle
 EMAIL_PORTS = [25, 110, 143, 465, 587, 993, 995, 2525] # SMTP, POP3, IMAP, SMTPS, SMTP-alt, IMAPS, POPS, SMTP-alt
 SHARED_SERVICE_PORTS = [111, 135, 137, 139, 445, 515, 548, 631, 873, 1025, 2049, 5357] # RPC bind, MSRPC, SMB, UNIX Printing, AFP/IP, CUPS, rsync, NFS or IIS, NFS, WSD-api
 AUTH_PORTS = [88, 389, 464, 543, 544, 636, 2105, 3268, 3269] # Kerberos, LDAP
@@ -802,7 +805,8 @@ if __name__ == "__main__":
 		# Discover hosts before scanning ports
 		if options.discoveryType != 'none':
 			ips = hostDiscovery(ips, options.discoveryType, privileged)
-		if not ips: exit()
+		# No discovered ip in LAN
+		if not ips and all(isPrivate(ipSpec) for ipSpec in ipSpecs): exit()
 		
 		# Create a structure to store results
 		results = OrderedDict((ip, ['']) for ip in sorted(ips))
