@@ -7,25 +7,39 @@ from time import time, strftime
 from optparse import OptionParser
 from collections import OrderedDict
 import re
-from bs4 import BeautifulSoup
-
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-
-from ipaddress import ip_address, ip_network, IPv4Address, IPv6Address, IPv4Network, IPv6Network
-from urllib2 import urlopen, URLError
-import socket
-import struct
-from fcntl import ioctl
 
 from threading import Thread, Lock
 from Queue import Queue
 from multiprocessing.dummy import Pool as ThreadPool
 
+from ipaddress import ip_address, ip_network, IPv4Address, IPv6Address, IPv4Network, IPv6Network
+import socket
+import struct
+from fcntl import ioctl
 from scapy.all import *
 
-VERBOSE = 0
-GLOBAL_LOCK = Lock()
+import cfg
+from cfg import PRINT, ERROR, WARN, INFO, STATUS, DEBUG
+from fingerprint import *
+
+
+class ScanResults(OrderedDict):
+	
+	def add(self, key, val):
+		if not key in self:
+			self[key] = ['']
+		self[key].append(val)
+		
+	def updateFromStructure(self, structure):
+		for ip, os, line in structure:
+			self.add(ip, line)
+			if not self[ip][0]:
+				self[ip][0] = os
+				
+	def os(self, key):
+		return self[key][0]
 
 def ifaceAddress(ifname):
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -63,20 +77,20 @@ def prefixToMask(prefix):
 def networkToHosts(ipWithPrefix):
 	ip, prefix = ipWithPrefix.split('/')
 	prefix = int(prefix)
-	#print 'prefix:', prefix
+	#DEBUG('prefix: %s', prefix)
 	ipFields = list(map(int, ip.split('.')))
 	ipInt = ints8ToInt32(ipFields)
-	#print 'IP:', bin(ipInt), ipInt, ipFields
+	#DEBUG('IP: %s %s %s', bin(ipInt), ipInt, ipFields)
 	mask = prefixToMask(prefix)
-	#print 'Mask:', bin(mask), mask, int32ToInts8(mask)
+	#DEBUG('Mask: %s %s %s', bin(mask), mask, int32ToInts8(mask))
 	curIp = mask & ipInt
-	#print 'Network address:', bin(curIp), curIp, int32ToInts8(curIp)
+	#DEBUG('Network address: %s %s %s', bin(curIp), curIp, int32ToInts8(curIp))
 	invMask = 2**(32-prefix)-1
 
 	while curIp & invMask < invMask-1:
 		curIp += 1
 		#if not (curIp % invMask) % (invMask/32+1):
-		#	print 'Current IP:', bin(curIp), curIp, int32ToInts8(curIp)
+		#	DEBUG('Current IP: %s %s %s', bin(curIp), curIp, int32ToInts8(curIp))
 		yield '.'.join(map(str, int32ToInts8(curIp)))
 
 def ipv4Range(ipStringRange):
@@ -106,7 +120,7 @@ def handleIps(ipSpecs, handlePrefix=True, handleRange=True):
 				ipSpec = socket.gethostbyname(net) + '/' + prefix
 				ip_network(unicode(ipSpec)) # Validation
 			except ValueError: 
-				if VERBOSE: print 'Error: malformed network ip'
+				ERROR('Error: malformed network ip')
 				continue
 			if handlePrefix: ips.extend(networkToHosts(ipSpec))
 			else: ips.append(ipSpec)
@@ -118,7 +132,7 @@ def handleIps(ipSpecs, handlePrefix=True, handleRange=True):
 				ipSpec = socket.gethostbyname(ipSpec)
 				ip_address(unicode(ipSpec)) # Validation
 			except:
-				if VERBOSE: print 'Error: malformed ip'
+				ERROR('Error: malformed ip')
 				continue
 			ips.append(ipSpec)
 			
@@ -158,13 +172,13 @@ def handlePorts(portStrings):
 			try:
 				ports.append(int(portString))
 			except ValueError:
-				print 'Error: Invalid port, port category or port range.'
+				ERROR('Error: Invalid port, port category or port range.')
 				exit(-1)
 	return ports
 	
 
 def tcp_connect(ips, ports, results):
-	print "\nRéalisation d'un scan TCP connect\n"
+	PRINT("\nRéalisation d'un scan TCP connect\n")
 	
 	def scan(structure):
 		results, dstIp, dstPort = structure
@@ -174,7 +188,7 @@ def tcp_connect(ips, ports, results):
 		sock.settimeout(2)
 		try:
 			sock.connect((dstIp, dstPort))
-			service = servFingerprinting2(dstIp, dstPort, sock)
+			service = servFingerprinting(dstIp, dstPort, sock)
 			sock.close()
 			etat = 'open'
 		except socket.timeout:
@@ -183,48 +197,53 @@ def tcp_connect(ips, ports, results):
 			etat = 'closed'
 
 		results[dstIp].append((dstPort, etat, service))
-		if VERBOSE: print 'ip ' + dstIp + ' port ' + str(dstPort) + ' ' + etat
+		INFO('ip %s port %s %s', dstIp, dstPort, etat)
 
 	upper, lower = max(len(ips), len(ports)), min(len(ports), len(ips))
-	print("pool base:", min(upper * min(4, lower), 1024))
+	INFO("pool base: %s", min(upper * min(4, lower), 1024))
 	pool = ThreadPool(min(upper * min(4, lower), 1024))
 	pool.map(scan, [(results, ip, port) for port in ports for ip in ips])
 	pool.close()
 	pool.join()
 	return results
 
+def queuedScan(scan, queue, ports, results):
+	while True:
+		ip = queue.get()
+		try:
+			res = scan(ip, ports)
+			results[ip] = res
+		except IOError as e:
+			ERROR('%s', e); raise
+		finally:
+			queue.task_done()
 
 def parallelScan(scan, ips, ports, results):
-	
-	def asyncScan(queue, results, ports):
-		while True:
-			ip = queue.get()
-			try:
-				results[ip] = scan(ip, ports)
-			except IOError as e:
-				print(e); raise
-			finally:
-				queue.task_done()
 
-	poolSize = min(len(ips), 512)
-	print "Pool size:", poolSize
+	poolSize = min(len(ips), 256)
+	INFO("Pool size: %s", poolSize)
 	queue = Queue()
 	
 	for i in range(poolSize):
-		worker = Thread(target=asyncScan, args=(queue, results, ports))
+		worker = Thread(target=queuedScan, args=(scan, queue, ports, results))
 		worker.daemon = True
 		worker.start()
 	
 	for ip in ips:
 		queue.put(ip)
 	queue.join()
+	DEBUG('results: %s', results)
+	# TODO: make this scan SCALE (with many hosts, results are very incomplete)
+	# TODO: thread pool, time management, retries, thread safety
+	# Solution1: 1 packet per thread? (pretty bad)
+	# Solution2: envoi de tous les paquets(, réception des paquets), puis traitements
 	# TODO: join all the threads to avoid minor errors?
 	
 	return results
 
 def syn(ip, ports):
 	result = ['']
-	ans, _ = sr(IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), inter=.1, timeout=2, verbose=(VERBOSE==2))
+	ans, _ = sr(IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), inter=.1, retry=1, timeout=5, verbose=(cfg.VERBOSE==2))
 		
 	for req, res in ans:
 		etat, service, cve = '', '', ''
@@ -237,14 +256,16 @@ def syn(ip, ports):
 				if(resTcp.flags == 0x12):
 					# Kernel send RST to end connection
 					etat = 'open'
-					service = servFingerprinting2(reqIp.dst, resTcp.sport)
+					service = servFingerprinting(reqIp.dst, resTcp.sport)
 					if service and not service.startswith('[') \
 					and resTcp.sport in [80, 8080, 8008, 8009, 8081, 8888]:
-						cve = ' '.join(searchCVE(*service.split('/')))
+						nbSlashes = service.count('/')
+						if nbSlashes > 0:
+							cve = ' '.join(searchCVE(*service.split('/', 1)))
 				elif (resTcp.flags == 0x14):
 					etat = 'closed'
 				else:
-					if VERBOSE: print 'Weird packet:', res.summary()
+					INFO('Weird packet: %s', res.summary())
 			elif(res.haslayer(ICMP)):
 				if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
 					etat = 'filtered'
@@ -253,18 +274,66 @@ def syn(ip, ports):
 				result[0] = passiveOsDetection(res)
 
 		result.append((req.getlayer(TCP).dport, etat, service, cve))
-		with GLOBAL_LOCK:
-			if VERBOSE: print 'ip', reqIp.dst, 'port', req.getlayer(TCP).dport, etat, cve
+		INFO('ip %s port %s %s %s', reqIp.dst, req.getlayer(TCP).dport, etat, cve)
 		
+	return result
+	
+def parallelScan2(scan, ips, ports, results): # one 
+
+	poolSize = min(len(ips), 256)
+	INFO("Pool size: %s", poolSize)
+	pool = ThreadPool(poolSize)
+	
+	res = pool.map(scan, ((ip, port) for ip in ips for port in ports))
+	DEBUG('res: %s', res)
+	results.updateFromStructure(res)
+	DEBUG('results: %s', results)
+	
+	return results
+	
+def syn2(structure):
+	ip, port = structure
+	result = ['']
+	res = sr1(IP(dst=ip)/TCP(sport=80,dport=port,flags="S"), timeout=2, verbose=(cfg.VERBOSE==2))
+
+	etat, service, cve = '', '', ''
+	if res == None:
+		etat = 'nores'
+	else:
+		if(res.haslayer(TCP)):
+			resTcp = res.getlayer(TCP)
+			if(resTcp.flags == 0x12):
+				# Kernel send RST to end connection
+				etat = 'open'
+				service = servFingerprinting(ip, port)
+				if service and not service.startswith('[') \
+				and port in [80, 8080, 8008, 8009, 8081, 8888]:
+					nbSlashes = service.count('/')
+					if nbSlashes > 0:
+						cve = ' '.join(searchCVE(*service.split('/', 1)))
+			elif (resTcp.flags == 0x14):
+				etat = 'closed'
+			else:
+				INFO('Weird packet: %s', res.summary())
+		elif(res.haslayer(ICMP)):
+			if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
+				etat = 'filtered'
+
+		if result[0] == '':
+			result[0] = passiveOsDetection(res)
+
+	result.append((port, etat, service, cve))
+	INFO('ip %s port %s %s %s', ip, port, etat, cve)
+	result.insert(0, ip)
 	return result
 
 def tcp_syn(ips, ports, results):
-	print "\nRéalisation d'un scan TCP SYN\n"
+	PRINT("\nRéalisation d'un scan TCP SYN\n")
 	
 	srcPort = 80#RandShort()
 	try:
 		ans, _ = sr(IP(dst=ips)/TCP(sport=srcPort,dport=ports,flags="S"),
-			timeout=2, inter=.0001, verbose=VERBOSE)
+			timeout=2, inter=.001, verbose=(cfg.VERBOSE==2))
 		
 		for req, res in ans:
 			etat, service = '', ''
@@ -277,11 +346,11 @@ def tcp_syn(ips, ports, results):
 					if(resTcp.flags == 0x12):
 						# Kernel send RST to end connection
 						etat = 'open'
-						service = servFingerprinting2(reqIp.dst, resTcp.sport)
+						service = servFingerprinting(reqIp.dst, resTcp.sport)
 					elif (resTcp.flags == 0x14):
 						etat = 'closed'
 					else:
-						if VERBOSE: print 'Weird packet:', res.summary()
+						INFO('Weird packet: %s', res.summary())
 				elif(res.haslayer(ICMP)):
 					if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
 						etat = 'filtered'
@@ -289,22 +358,23 @@ def tcp_syn(ips, ports, results):
 				if results[reqIp.dst][0] == '':
 					results[reqIp.dst][0] = passiveOsDetection(res)
 
-			results[reqIp.dst].append((req.getlayer(TCP).dport, etat, service))
-			if VERBOSE: print 'ip', reqIp.dst, 'port', req.getlayer(TCP).dport, etat
+			results[reqIp.dst].append((req.getlayer(TCP).dport, etat, service, ''))
+			INFO('ip %s port %s %s', reqIp.dst, req.getlayer(TCP).dport, etat)
 
 	except IOError as e:
-		print(e)
+		ERROR('%s', e)
 
 	return results
 
 def tcp_syn2(ips, ports, results):
-	print "\nRéalisation d'un scan TCP SYN\n"
+	PRINT("\nRéalisation d'un scan TCP SYN\n")
 	
 	def scan(queue, lock, results, ports):
 		while True:
 			ip = queue.get()
 			try:
-				ans, _ = sr(IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), timeout=5, inter=.00001, verbose=(VERBOSE==2))
+				ans, _ = sr(IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), \
+				timeout=5, inter=.1, verbose=(cfg.VERBOSE==2))
 				
 				for req, res in ans:
 					etat, service = '', ''
@@ -319,11 +389,11 @@ def tcp_syn2(ips, ports, results):
 							if resTcp.flags == 0x12:
 								# Kernel send RST to end connection
 								etat = 'open'
-								service = servFingerprinting2(ip, port)
+								service = servFingerprinting(ip, port)
 							elif resTcp.flags == 0x14:
 								etat = 'closed'
 							else:
-								if VERBOSE: print 'Weird packet:', res.summary()
+								INFO('Weird packet: %s', res.summary())
 						elif res.haslayer(ICMP):
 							if int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]:
 								etat = 'filtered'
@@ -332,18 +402,17 @@ def tcp_syn2(ips, ports, results):
 							results[ip][0] = passiveOsDetection(res)
 
 					with lock:
-						results[ip].append((port, etat, service))
-						if VERBOSE:
-							print 'ip {} port {} {}'.format(ip, port, etat)
+						results[ip].append((port, etat, service, ''))
+					INFO('ip %s port %s %s', ip, port, etat)
 
 			except IOError as e:
-				print(e); raise
+				ERROR('%s', e); raise
 			finally:
 				queue.task_done()
 
 	upper, lower = max(len(ips), len(ports)), min(len(ports), len(ips))
-	poolSize = min(len(ips), 512)#min(upper * min(4, lower), 1024)
-	print "Pool size:", poolSize
+	poolSize = min(len(ips), 256)#min(upper * min(4, lower), 1024)
+	INFO("Pool size: %s", poolSize)
 	queue = Queue()
 	lock = Lock()
 	
@@ -359,7 +428,7 @@ def tcp_syn2(ips, ports, results):
 	return results
 
 def tcp_syn3(ips, ports, results):
-	print "\nRéalisation d'un scan TCP SYN\n"
+	PRINT("\nRéalisation d'un scan TCP SYN\n")
 	
 	def scan(queue, lock, results, ports):
 		sock = conf.L3socket(filter=None, iface=conf.iface, nofilter=1)
@@ -367,7 +436,8 @@ def tcp_syn3(ips, ports, results):
 			while True:
 				ip = queue.get()
 				try:
-					ans, _ = sndrcv(sock, IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), inter=.00001, timeout=2, verbose=(VERBOSE==2))
+					ans, _ = sndrcv(sock, IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), \
+					inter=.1, timeout=2, verbose=(cfg.VERBOSE==2))
 					
 					for req, res in ans:
 						etat, service = '', ''
@@ -382,11 +452,11 @@ def tcp_syn3(ips, ports, results):
 								if resTcp.flags == 0x12:
 									# Kernel send RST to end connection
 									etat = 'open'
-									service = servFingerprinting2(ip, port)
+									service = servFingerprinting(ip, port)
 								elif resTcp.flags == 0x14:
 									etat = 'closed'
 								else:
-									if VERBOSE: print 'Weird packet:', res.summary()
+									INFO('Weird packet: %s', res.summary())
 							elif res.haslayer(ICMP):
 								if int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]:
 									etat = 'filtered'
@@ -395,20 +465,19 @@ def tcp_syn3(ips, ports, results):
 								results[ip][0] = passiveOsDetection(res)
 
 						with lock:
-							results[ip].append((port, etat, service))
-							if VERBOSE:
-								print 'ip {} port {} {}'.format(ip, port, etat)
+							results[ip].append((port, etat, service, ''))
+						INFO('ip %s port %s %s', ip, port, etat)
 
 				except IOError as e:
-					print(e); raise
+					ERROR('%s', e); raise
 				finally:
 					queue.task_done()
 		finally:
 			sock.close()
 
 	upper, lower = max(len(ips), len(ports)), min(len(ports), len(ips))
-	poolSize = min(len(ips), 512)#min(upper * min(4, lower), 1024)
-	print "Pool size:", poolSize
+	poolSize = min(len(ips), 256)#min(upper * min(4, lower), 1024)
+	INFO("Pool size: %s", poolSize)
 	queue = Queue()
 	lock = Lock()
 	
@@ -424,13 +493,13 @@ def tcp_syn3(ips, ports, results):
 	return results
 
 def tcp_xmas(ips, port):
-	print "Réalisation d'un scan TCP Xmas\n"
+	PRINT("\nRéalisation d'un scan TCP Xmas\n")
 	try:
 		dstIp = ips
 		srcPort = random.randint(1, 65535)#RandShort()
 		dstPort = port
 
-		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,gflags="FPU"),timeout=5, verbose=VERBOSE)
+		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,gflags="FPU"),timeout=5, verbose=cfg.VERBOSE)
 		if packet == None:
 			etat=1
 			dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
@@ -444,16 +513,16 @@ def tcp_xmas(ips, port):
 				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
 
 	except IOError as e:
-		print(e)
+		ERROR('%s', e)
 
 def tcp_fin(ips, port):
-	print "Réalisation d'un scan FIN\n"
+	PRINT("\nRéalisation d'un scan FIN\n")
 	try:
 		dstIp = ips
 		srcPort = random.randint(1,65535)
 		dstPort = port
 
-		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,flags="F"),timeout=1, verbose=VERBOSE)
+		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,flags="F"),timeout=1, verbose=cfg.VERBOSE)
 		if packet == None:
 			etat=1
 			dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
@@ -469,16 +538,16 @@ def tcp_fin(ips, port):
 				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
 
 	except IOError as e:
-		print(e)
+		ERROR('%s', e)
 
 def tcp_null(ips, port):
-	print "Réalisation d'un scan NULL\n"
+	PRINT("\nRéalisation d'un scan NULL\n")
 	try:
 		dstIp = ips
 		srcPort = random.randint(1,65535)
 		dstPort = port
 
-		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,flags=""),timeout=1, verbose=VERBOSE)
+		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,flags=""),timeout=1, verbose=cfg.VERBOSE)
 		if packet == None:
 			etat=1
 			dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
@@ -492,15 +561,15 @@ def tcp_null(ips, port):
 				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
 
 	except IOError as e:
-		print(e)
+		ERROR('%s', e)
 
 def udp(ips, ports, results):
+	PRINT("\nRéalisation d'un scan UDP\n")
 	try:
 		srcPort = RandShort()
 		for dstPort in ports:
 			os, server = '', ''
 			for dstIp in ips:
-				if VERBOSE: print 'ip', dstIp
 				packet1 = sr1(IP(dst=dstIp)/UDP(dport=dstPort),timeout=2, verbose=0)
 				if packet1 == None:
 					packet2 = sr1(IP(dst=dstIp)/UDP(dport=dstPort),timeout=2, verbose=0)
@@ -521,13 +590,13 @@ def udp(ips, ports, results):
 				elif packet2 != None:
 					os = passiveOsDetection(packet2)
 				if etat == "Open|Filtered" or "Filtered":
-					service = servFingerprinting2(dstIp, dstPort)
+					service = servFingerprinting(dstIp, dstPort)
 
 				results[dstIp].append((dstPort, etat, service))
-				if VERBOSE: print 'port', dstPort, etat
+				INFO('ip %s port %s %s', dstIp, dstPort, etat)
 
 	except IOError as e:
-		print(e)
+		ERROR('%s', e)
 
 	return results
 	
@@ -555,189 +624,6 @@ def icmpPingSweep(ips):
 	pool.join()
 	return filter(None, results)
 
-def passiveOsDetection(packet):
-	os = ""
-	if int(packet.getlayer(IP).ttl) == 128:
-		os = "Windows"
-		if packet.haslayer(TCP):
-			if int(packet.getlayer(TCP).window) == 8192:
-				os = "Windows 7"
-			elif int(packet.getlayer(TCP).window) == 65535:
-				os = "Windows XP"
-	elif int(packet.getlayer(IP).ttl) == 64:
-		os = "Linux"
-		
-	if VERBOSE and os: print 'OS:', os
-	
-	return os
-
-def versionServ(hostname, port, sock):
-	if not sock:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	sock.settimeout(2)
-	data = ''
-	try:
-		sock.connect((hostname, port))
-		data = sock.recv(2048)
-		sock.close()
-	except socket.timeout:
-		print "timeout"
-	except IOError as e:
-		print e
-	
-	return data.strip()
-
-def servFingerprinting2(dstIp, dstPort, sock=None): # TODO
-	serv = ''
-	print 'Fingerprinting'
-	if dstPort == 80:
-		res = None
-		try:
-			res = urlopen('http://' + dstIp + ":80", timeout=1)
-			if VERBOSE: print 'Status code:', res.code
-			serv = ''.join(res.info().getheaders('server')[:1])
-			res.close()
-		except URLError as e:
-			if VERBOSE: print 'Status code:', e.code
-			if e.code < 500:
-				serv = ''.join(e.info().getheaders('server')[:1])
-				if not serv:
-					html = res.read()
-					soup = BeautifulSoup(html, "lxml")
-					# TODO: test parsing
-					print soup.address
-					list_serv = http_vers(soup.address)
-					serv = '/'.join(list_serv)
-			if not serv:
-				serv = '[HTTP GET status {}]'.format(e.code)
-		except socket.timeout:
-			if VERBOSE: print 'timeout'
-		except IOError as e:
-			if VERBOSE: print e 
-	
-	if dstPort == 22: # SSH
-		banner = versionServ(dstIp, dstPort, sock)
-		list_serv = ssh_vers(banner)
-		serv = '/'.join(list_serv)
-		
-	if dstPort == 21: # FTP
-		banner = versionServ(dstIp, dstPort, sock)
-		list_serv = ftp_serv(banner)
-		serv = '/'.join(list_serv)
-	
-	if dstPort == 53: # DNS 
-		version = versionBindDns(dstIp,dstPort)
-		serv = "Bind/" + version
-		
-	if VERBOSE and serv: print 'service:', serv
-	
-	return serv
-	
-def http_vers(chaine):
-	list_http = ["Apache","Apache Tomcat","busybox httpd","Microsoft-IIS","lighttpd","nginx","Sun-Java-System-Web-Server", "Zeus"]
-	liste_serv = []
-	#chaine = "Microsoft-IIS/2.4.9"
-	for elt in list_http:
-		researchServ = re.search(elt,chaine)
-		if re.search(elt,chaine,re.I):
-			print "ok "+elt
-			serveur = elt
-			researchVer=re.search("/([0-9.]+[0-9.]+[0-9])",chaine)
-			version=researchVer.group(0)
-			print "version = "+version[1:]
-			break
-			liste_serv.append(serveur)
-			liste_serv.append(version[1:])
-	return liste_serv
-
-def ftp_vers(chaine):
-	dict_ftp = {"FileZilla Server":"[0-9.]+[0-9.]+[0-9]* | [0-9.]+[0-9.]+[0-9a]","vsFTPd":"([0-9.]+[0-9.]+[0-9]*)","ProFTPD":"[0-9.]+[0-9.]+[0-9.]+[0-9]rc","WeOnlyDo-wodFTPD":"[0-9.]+[0-9.]+[0-9]*"}
-	liste_serv = []
-	for service,regex in dict_ftp.items():
-		researchVer = re.search(regex,chaine,re.I)
-		if re.search(service,chaine,re.I) is not None :
-			serveur = service
-			if serveur is "WeOnlyDo-wodFTPD":
-				serveur ="freeFTPd"
-			print "ok "+serveur
-			if researchVer is not None :
-				version = researchVer.group(0)
-				version = version.replace("(","")
-				version = version.replace(")","")
-				break
-			liste_serv.append(serveur)
-			liste_serv.append(version)
-	return liste_serv
-				
-def ssh_vers(chaine):
-	dict_ssh = {"OpenSSH":"_[0-9.]+[0-9.]+[0-9]+p+[0-9]","WeOnlyDo-wodSSHD":" [0-9.]+[0-9.]+[0-9]*"}
-	liste_serv = []
-	for service,regex in dict_ssh.items():
-		researchVer = re.search(regex,chaine,re.I)
-		if re.search(service,chaine,re.I) is not None :
-			serveur = service
-			if serveur is "WeOnlyDo-wodSSHD":
-				serveur ="freeSSHd"
-			print "ok "+serveur
-			if researchVer is not None :
-				version= researchVer.group(0)
-				break
-			liste_serv.append(serveur)
-			liste_serv.append(version[1:])
-	return liste_serv
-		
-def versionBindDns(dstIp,dstPort):
-	res = sr1(IP(dst=dstIp)/UDP(dport=dstPort)/DNS(rd=1,qd=DNSQR(qclass=3, qtype=16, qname='version.bind.')))
-	return res[DNS].an.rdata.strip()
-
-def servFingerprinting(dstIp, dstPort, sock=None): # TODO: faire un vrai fingerprinting
-	serv = 'unknown'
-	liste = []
-	if dstPort == 80:
-		try:
-			res = requests.head('http://' + dstIp + ":80", timeout=1)
-			url = 'http://' + dstIp + ":80"
-			sock = urllib.urlopen(url)
-			htmlSource = sock.read()
-			sock.close()
-			soup = BeautifulSoup.BeautifulSoup(htmlSource, "lxml")
-
-			if res.status_code == 200:
-				serv = res.headers["server"]
-				sep1=serv.split(' ')
-				sep2=sep1[0].split('/')
-				liste.append(sep2[0])
-				liste.append(sep2[1])
-			else:
-				serv = '[HTTP status {}]'.format(res.status_code)
-				liste.append(serv)
-		except requests.exceptions.Timeout:
-			if VERBOSE: print "connection timeout"
-		except ConnectionError:
-			if VERBOSE: print "connection error"
-	if dstPort == 22: # SSH
-		serv = versionServ(dstIp, dstPort, sock)
-		liste.append(serv)
-	if dstPort == 21: # FTP
-		serv = versionServ(dstIp, dstPort, sock)
-		liste.append(serv)
-	return liste
-
-
-def searchCVE(service, version):
-	"""Return a list of strings"""
-	
-	url = "https://cve.mitre.org/cgi-bin/cvekey.cgi?keyword="+service+"+"+version
-	res = urlopen(url)
-	html = res.read()
-	res.close()
-	soup = BeautifulSoup(html, "lxml")
-	
-	listCVE = []
-	for elt in soup.find_all('a', attrs={'href' : re.compile("^/cgi-bin/")}):
-		listCVE.append(elt.get_text())
-	return listCVE
-
 def hostDiscovery(ipSpecs, dtype, privileged):
 	ips = []
 	isLan = all(isPrivate(ipSpec) for ipSpec in ipSpecs)
@@ -750,30 +636,29 @@ def hostDiscovery(ipSpecs, dtype, privileged):
 	elif privileged == 1: dtype = ['icmp_lowpriv']
 
 	if 'arp' in dtype:
-		print 'Using ARP ping for host discovery'
-		ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ipSpecs),retry=0,timeout=2, inter=.00001, verbose=VERBOSE)
+		PRINT('Using ARP ping for host discovery')
+		ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ipSpecs),retry=0,timeout=2, inter=.00001, verbose=cfg.VERBOSE)
 		ips.extend(r.getlayer(ARP).psrc for _, r in ans if r.haslayer(ARP))
 		for _, r in ans:
 			if r.haslayer(ARP):
 				conf.netcache.arp_cache[r[ARP].psrc] = r[ARP].hwsrc
-		if VERBOSE:
-			print "\narp cache:"; print conf.netcache.arp_cache
-			print '\nips:', ips, '\n'
+		INFO("\narp cache:\n%s", conf.netcache.arp_cache)
+		INFO('\nips: %s\n', ips)
 		
 	if 'icmp_lowpriv' in dtype:
-		print 'Using ICMP echo ping for host discovery'
+		PRINT('Using ICMP echo ping for host discovery')
 		ips.extend(icmpPingSweep(handleIps(ipSpecs, True, True)))
 	elif 'icmp' in dtype:
-		print 'Using ICMP echo/timestamp ping for host discovery'
-		ans, _ = sr(IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.00001, verbose=VERBOSE)
+		PRINT('Using ICMP echo/timestamp ping for host discovery')
+		ans, _ = sr(IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.00001, verbose=cfg.VERBOSE)
 		ips.extend(r.getlayer(IP).src for _, r in ans if r.haslayer(IP))
 	elif 'icmp_broadcast' in dtype:
-		print 'Using ICMP echo/timestamp broadcast ping for host discovery'
-		ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff')/IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.00001, verbose=VERBOSE)
+		PRINT('Using ICMP echo/timestamp broadcast ping for host discovery')
+		ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff')/IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.00001, verbose=cfg.VERBOSE)
 		ips.extend(r.getlayer(IP).src for _, r in ans if r.haslayer(IP))
 		
 	ips = sorted(set(ips))
-	print 'Alive hosts:', ','.join(ips) or 'none'
+	PRINT('Alive hosts: %s', ','.join(ips) or 'none')
 	return list(ips)
 
 def priviledgeLevel():
@@ -786,35 +671,17 @@ def priviledgeLevel():
 				socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
 				return 1
 			except socket.error as errIcmp:
-				print 'err icmp:', errIcmp
+				DEBUG('err icmp: %s', errIcmp)
 				if errIcmp[0] in [errno.EPERM, errno.EACCES]:
 					pass#raise
 			return 0
-		print 'err raw:', errRaw
+		DEBUG('err raw: %s', errRaw)
 	raise RuntimeError('wtf?')
-
-def toService(port, fingerprint='', fmt=True):
-	if fingerprint not in ['', 'unknown']:
-		return ' ' + fingerprint
-	else:
-		res = '?'
-		with open('nmap-services', 'r') as servicesAssoc:
-			servicesAssoc.seek(23)
-			for line in servicesAssoc:
-				if line.startswith('unknown'):
-					continue
-				portLineMatch = re.search(r'\s(' + str(port) + ')/', line[:25])
-				if portLineMatch:
-					firstSpaceIndex = re.search(r'\s', line[:25]).start()
-					res = line[:firstSpaceIndex]
-					break
-		
-		return '(' + res + ')' if fmt else res
 
 # Server ports
 # 1-1023: well-known, 1024-49151: vendor registered, 49152-65535: dynamic/private
-VERY_COMMON_PORTS = [20, 21, 22, 23, 53, 80, 443, 8000, 8080, 8433] # FTP, SSH, Telnet, DNS, HTTP, HTTPS, HTTP Proxy, HTTP-alt, HTTPS-alt
-OTHER_COMMON_PORTS = [81, 990, 1027, 3128, 8008, 8009, 8081, 8888, 32768, 32769] # HOSTS2, FTPS, IIS, Squid proxy, IBM HTTP, Apache JServ, various HTTP, Sun HTTP, IBM Filenet
+VERY_COMMON_PORTS = [21, 22, 23, 53, 80, 443, 1027, 8000, 8080, 8433] # FTP, SSH, Telnet, DNS, HTTP, HTTPS, IIS, HTTP Proxy, HTTP-alt, HTTPS-alt
+OTHER_COMMON_PORTS = [81, 990, 3128, 8008, 8009, 8081, 8888, 32768, 32769] # HOSTS2, FTPS, Squid proxy, IBM HTTP, Apache JServ, various HTTP, Sun HTTP, IBM Filenet
 DATABASE_PORTS = [1433, 1434, 1521, 1528, 2483, 2484, 3050, 3306, 5432] # MySQL, PostgreSQL, MSSQL, Oracle
 EMAIL_PORTS = [25, 110, 143, 465, 587, 993, 995, 2525] # SMTP, POP3, IMAP, SMTPS, SMTP-alt, IMAPS, POPS, SMTP-alt
 SHARED_SERVICE_PORTS = [111, 135, 137, 139, 445, 515, 548, 631, 873, 1025, 2049, 5357] # RPC bind, MSRPC, SMB, UNIX Printing, AFP/IP, CUPS, rsync, NFS or IIS, NFS, WSD-api
@@ -830,11 +697,11 @@ COMMON_PORTS = VERY_COMMON_PORTS + OTHER_COMMON_PORTS + SHARED_SERVICE_PORTS + E
 
 if __name__ == "__main__":
 
-	print """
+	PRINT("""
 +-------------------------------------------------------+
 |   Bienvenue dans notre programme de scan de ports !   |
 +-------------------------------------------------------+
-"""
+""")
 
 	parser = OptionParser()
 	parser.add_option("-i", "--iface", dest="iface", type="string", help='interface to use')
@@ -851,45 +718,44 @@ if __name__ == "__main__":
 
 	if len(args) == 0:
 		parser.print_help()
-		print
-		print 'Run `sysctl -w net.ipv4.ping_group_range="0 your_gid"` to allow unpriviledged users to use ICMP ping'
-		print 'Run `setcap cap_net_raw=ep` as root on your python interpreter to allow raw sockets'
+		PRINT('\nRun `sysctl -w net.ipv4.ping_group_range="0 your_gid"` to allow unpriviledged users to use ICMP ping')
+		PRINT('Run `setcap cap_net_raw=ep` as root on your python interpreter to allow raw sockets')
 	else:
-		VERBOSE = options.verbose
-		conf.verb = VERBOSE >= 2
-		#if VERBOSE == 1: logging.getLogger("scapy.runtime").setLevel(logging.DEBUG)
+		cfg.VERBOSE = options.verbose
+		conf.verb = cfg.VERBOSE >= 2
+		#if cfg.VERBOSE == 1: logging.getLogger("scapy.runtime").setLevel(logging.DEBUG)
 		if options.iface: conf.iface = options.iface
 		conf.ipv6_enabled = False
 		outFile = options.output
 		
 		# Check for priviledge level
 		privileged = priviledgeLevel()
-		if VERBOSE: print 'Priviledge level:', privileged
+		INFO('Priviledge level: %s', privileged)
 		if privileged == 0: exit()
 		
 		ipSpecs = args[0].split(',')
 		ips = handleIps(ipSpecs, True, True)
-		if VERBOSE >= 2: print 'Hosts to scan:', ips
+		STATUS('Hosts to scan: %s', ips)
 		portStrings = options.ports.split(',')
 		ports = handlePorts(portStrings)
 
 		# Discover hosts before scanning ports
 		if options.discoveryType != 'none':
 			ips = hostDiscovery(ips, options.discoveryType, privileged)
-
-		# No discovered ip in LAN
-		if not ips : exit()
+			
+		# Quit if no discovered ip for LAN scan
+		if not options.forceScan and not ips and all(isPrivate(ipSpec) for ipSpec in ipSpecs): exit()
 		
 		# Create a structure to store results
-		results = OrderedDict((ip, ['']) for ip in sorted(ips))
+		results = ScanResults((ip, ['']) for ip in sorted(ips))
 		
 		if ips:
 			# Launch scan
 			if options.scantype == "c" or privileged < 2:
 				results = tcp_connect(ips, ports, results)
 			elif options.scantype == "s":
-				results = parallelScan(syn, ips, ports, results)
-				#results = tcp_syn3(ips, ports, results)
+				results = parallelScan2(syn2, ips, ports, results)
+				#results = tcp_syn(ips, ports, results)
 			elif options.scantype == "x":
 				results = tcp_xmas(ips, port)
 			elif options.scantype == "n":
@@ -910,17 +776,17 @@ if __name__ == "__main__":
 				policy = 'filtered'
 				
 			# Generate output
-			out.append('\nip: ' + resultIP + "\nOS: " + (resultData[0] or 'unknown') + "\nlikely policy: " + (policy or 'unknown') + '\nports: {} open'.format(sum(1 for dstPort, etat, _, _ in resultData[1:] if etat == 'open')))
+			out.append('\nip: ' + resultIP + "\nOS: " + (resultData[0] or 'unknown') + "\nlikely policy: " + (policy or 'unknown') + '\nports: {} open'.format(sum(1 for _, etat, _, _ in resultData[1:] if etat == 'open')))
 			for dstPort, etat, service, cve in resultData[1:]:
 				if etat != 'nores' and etat != policy:
 					#out.append(str(dstPort) + " " + (etat or 'unknown') + toService(dstPort, service)) + " " + cve
 					out.append(' '.join([str(dstPort), etat or 'unknown', toService(dstPort, service), cve]))
 		
-		print '''
+		PRINT('''
 +--------------------------------------------+
 |  Report                                    |
-+--------------------------------------------+'''
-		print '\n'.join(out)
++--------------------------------------------+''')
+		PRINT('\n'.join(out))
 		if outFile: # Dump to file
 			with open(outFile, 'a+') as dumpFile:
 				dumpFile.write(strftime("%d %b %Y %H:%M:%S") + '\n')
