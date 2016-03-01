@@ -689,7 +689,7 @@ def ssh_vers(chaine):
 def versionBindDns(dstIp,dstPort):
 	res = sr1(IP(dst=dstIp)/UDP(dport=dstPort)/DNS(rd=1,qd=DNSQR(qclass=3, qtype=16, qname='version.bind.')))
 	return res[DNS].an.rdata.strip()
-	
+
 def servFingerprinting(dstIp, dstPort, sock=None): # TODO: faire un vrai fingerprinting
 	serv = 'unknown'
 	liste = []
@@ -876,9 +876,9 @@ if __name__ == "__main__":
 		# Discover hosts before scanning ports
 		if options.discoveryType != 'none':
 			ips = hostDiscovery(ips, options.discoveryType, privileged)
-			
-		# Quit if no discovered ip for LAN scan
-		if not options.forceScan and not ips and all(isPrivate(ipSpec) for ipSpec in ipSpecs): exit()
+
+		# No discovered ip in LAN
+		if not ips : exit()
 		
 		# Create a structure to store results
 		results = OrderedDict((ip, ['']) for ip in sorted(ips))
