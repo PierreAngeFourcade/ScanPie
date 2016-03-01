@@ -9,27 +9,31 @@ import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 from urllib2 import urlopen, URLError
+import requests
 import socket
 from scapy.all import *
 
-import ScanPie as sp
+import cfg
+from cfg import PRINT, ERROR, WARN, INFO, STATUS, DEBUG
 
 def servFingerprinting(dstIp, dstPort, sock=None): # TODO
 	serv = ''
-	if sp.VERBOSE: print 'Fingerprinting', dstIp, dstPort
-	if dstPort == 80: # HTTP
-		serv = httpServ(dstIp, dstPort)
-	if dstPort == 22: # SSH
-		banner = versionServ(dstIp, dstPort, sock)
-		serv = '/'.join(ssh_vers(banner))
-	if dstPort == 21: # FTP
-		banner = versionServ(dstIp, dstPort, sock)
-		serv = '/'.join(ftp_vers(banner))
-	if dstPort == 53: # DNS (Que bind faut pas déconner) 
-		serv = "Bind/" + versionBindDns(dstIp,dstPort)
+	INFO('Fingerprinting: %s %s', dstIp, dstPort)
+	try:
+		if dstPort in [80, 8080, 8008, 8009, 8081, 8888, 443, 8443]: # HTTP(S)
+			serv = httpServ(dstIp, dstPort)
+		if dstPort == 22: # SSH
+			banner = versionServ(dstIp, dstPort, sock)
+			serv = '/'.join(ssh_vers(banner))
+		if dstPort == 21: # FTP
+			banner = versionServ(dstIp, dstPort, sock)
+			serv = '/'.join(ftp_vers(banner))
+		if dstPort == 53: # DNS (Bind seulement) 
+			serv = "Bind/" + versionBindDns(dstIp, dstPort)
+	except Exception as e:
+		INFO('Fingerprinting error: %s', e)
 	
-	print 'sp.VERBOSE:', sp.VERBOSE
-	if sp.VERBOSE and serv: print 'service:', serv
+	if serv: INFO('service: %s', serv)
 	
 	return serv
 	
@@ -43,36 +47,35 @@ def versionServ(hostname, port, sock):
 		data = sock.recv(2048)
 		sock.close()
 	except socket.timeout:
-		print "timeout"
+		INFO("timeout")
 	except IOError as e:
-		print e
+		INFO('%s', e)
 	
 	return data.strip()
 	
 def httpServ(dstIp, dstPort=80):
-	res = None
+	serv = ''
 	try:
-		res = urlopen('http://' + dstIp + ":" + str(dstPort), timeout=1)
-		if sp.VERBOSE: print 'Status code:', res.code
-		serv = ''.join(res.info().getheaders('server')[:1])
+		if dstPort in [80, 8080, 8008, 8009, 8081, 8888]: proto = 'http'
+		if dstPort in [443, 8443]: proto = 'https'
+		res = requests.get(proto + '://' + dstIp + ":" + str(dstPort), timeout=2)
+		INFO('Status code: %s', res.status_code)
+		if 'server' in res.headers:
+			serv = ''.join(res.headers['server'])
 		res.close()
-	except URLError as e:
-		if sp.VERBOSE: print 'Status code:', e.code
-		if e.code < 500:
-			serv = ''.join(e.info().getheaders('server')[:1])
-			if not serv:
-				html = res.read()
-				soup = BeautifulSoup(html, "lxml")
-				# TODO: test parsing
-				print soup.address
-				list_serv = http_vers(soup.address)
-				serv = '/'.join(list_serv)
+		if not serv and 400 <= res.status_code < 500:
+			html = res.content
+			soup = BeautifulSoup(html, "lxml")
+			# TODO: test parsing
+			DEBUG('soup.address: %s', soup.address)
+			list_serv = http_vers(soup.address)
+			serv = '/'.join(list_serv)
 		if not serv:
-			serv = '[HTTP GET status {}]'.format(e.code)
-	except socket.timeout:
-		if sp.VERBOSE: print 'timeout'
+			serv = '[HTTP GET status {}]'.format(res.status_code)
+	except requests.Timeout:
+		INFO('timeout')
 	except IOError as e:
-		if sp.VERBOSE: print e 
+		INFO('%s', e) 
 		
 	return serv
 	
@@ -86,10 +89,10 @@ def http_vers(chaine):
 			serveur = elt
 			researchVer=re.search("/([0-9.]+[0-9.]+[0-9])",chaine)
 			version=researchVer.group(0)
-			print "version: " + version[1:]
-			break
+			INFO("version: %s", version[1:])
 			liste_serv.append(serveur)
 			liste_serv.append(version[1:])
+			break
 	return liste_serv
 
 def ftp_vers(chaine):
@@ -127,7 +130,7 @@ def ssh_vers(chaine):
 			liste_serv.append(version[1:])
 	return liste_serv
 		
-def versionBindDns(dstIp,dstPort):
+def versionBindDns(dstIp, dstPort):
 	res = sr1(IP(dst=dstIp)/UDP(dport=dstPort)/DNS(rd=1,qd=DNSQR(qclass=3, qtype=16, qname='version.bind.')))
 	return res[DNS].an.rdata.strip()
 
@@ -157,13 +160,13 @@ def passiveOsDetection(packet):
 	elif int(packet.getlayer(IP).ttl) == 64:
 		os = "Linux"
 		
-	if sp.VERBOSE and os: print 'OS:', os
+	if os: INFO('OS: %s', os)
 	
 	return os
 	
 def toService(port, fingerprint='', fmt=True):
-	if fingerprint not in ['', 'unknown']:
-		return ' ' + fingerprint
+	if fingerprint != '':
+		return fingerprint
 	else:
 		res = '?'
 		with open('nmap-services', 'r') as servicesAssoc:

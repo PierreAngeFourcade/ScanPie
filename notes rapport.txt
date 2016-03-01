@@ -19,7 +19,7 @@ Niveaux d'avancement: 1 (ébauche), 2 (implémentation), 3 (finalisé, choix eff
 - rapport affiché et enregistré
 - intégration détection OS
 - intégration détection services (configurations courantes)
-- testé option kernel arp_ignore (8: bloque ARP) et arp
+- testé option kernel arp_ignore (8: bloque ARP) et arp_accept
 - essayé d'implémenter SCTP ping
 - différencié actions privilégiées et non privilégiées (raw socket vs. socket)
 - nmap utilise ICMP echo ping si non ARP ping
@@ -33,7 +33,7 @@ Niveaux d'avancement: 1 (ébauche), 2 (implémentation), 3 (finalisé, choix eff
 
 - broadcast ping, le retour
 
-- Limites de scapy
+- Limites de scapy (pas thread-safe)
 	- mauvaise gestion du parallélisme
 		- fork + cPickle
 		- Pickle est limité dans ce qu'il peut sérialiser
@@ -49,3 +49,14 @@ Niveaux d'avancement: 1 (ébauche), 2 (implémentation), 3 (finalisé, choix eff
 	- grant all priviledges on database scandb to littlescapy;
 	
 - parallélisé + async SYN scan
+
+- recherches ports éphémères et ajouts ports
+
+- Recherches vacances février
+	- approfondi BGP (TCP/IP Guide)
+	- lu thèse cartographie réseau
+	- BDD en ligne routes BGP: RouteViews
+		- 53 FAI, assez complet et à jour
+		- accès public via route-views2.routeviews.org:23
+	- traceroute pour cartographier, mais comment connaitre plus d'un voisin?
+	- SNMP pour cartographier, mais limité aux utilisateurs de SNMP
