@@ -25,9 +25,13 @@ def servFingerprinting(dstIp, dstPort, sock=None): # TODO
 		if dstPort == 22: # SSH
 			banner = versionServ(dstIp, dstPort, sock)
 			serv = '/'.join(ssh_vers(banner))
+			if serv == '':
+				serv = banner
 		if dstPort == 21: # FTP
 			banner = versionServ(dstIp, dstPort, sock)
 			serv = '/'.join(ftp_vers(banner))
+			if serv == '':
+				serv = banner
 		if dstPort == 53: # DNS (Bind seulement) 
 			serv = "Bind/" + versionBindDns(dstIp, dstPort)
 	except Exception as e:
@@ -138,15 +142,13 @@ def searchCVE(service, version):
 	"""Return a list of strings"""
 	
 	url = "https://cve.mitre.org/cgi-bin/cvekey.cgi?keyword="+service+"+"+version
-	res = urlopen(url)
-	html = res.read()
-	res.close()
-	soup = BeautifulSoup(html, "lxml")
+	res = requests.get(url)
+	soup = BeautifulSoup(res.content, "lxml")
 	
 	listCVE = []
 	for elt in soup.find_all('a', attrs={'href' : re.compile("^/cgi-bin/")}):
 		listCVE.append(elt.get_text())
-	return listCVE
+	return url, listCVE
 
 def passiveOsDetection(packet):
 	os = ""
