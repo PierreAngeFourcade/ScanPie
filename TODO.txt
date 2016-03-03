@@ -1,0 +1,34 @@
+Découverte hotes:
+
+- pas de broadcast pour le scan ping de préférence
+- améliorer choix technique de découverte
+- techniques de découvertes si ARP&ICMP bloqué
+En plus des ping ICMP echo et ARP
+- SYN et SYN+ACK, pour les pare-feu stateful
+- ACK, pour les pare-feu stateless
+- ICMP «timestamp», «information» et «adress mask», types 13, 15 et 17
+- SCTP ping
+- IP Proto (pas utile à priori)
+
+
+Ports:
+- 
+
+Ip:
+- différencier les scans internes et externes
+
+Scans:
+- handle split handshake (SYN+ACK -> SYN)?
+- study timeouts, limit rate
+- sometimes does not send anything ?!?
+
+Services:
+- 
+
+Cartographie
+- recherche techniques de cartographie
+- BGP to talk to arbitrary router
+- passive sniffing if LAN contiguous
+
+BDD - analyse
+- 

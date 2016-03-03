@@ -1,0 +1,62 @@
+Niveaux d'avancement: 1 (ébauche), 2 (implémentation), 3 (finalisé, choix effectués)
+
+- récupéré exemple de scan TCP connect
+- 3 gestion des adresses IP et des ports
+- 2 écriture des résultats dans un fichier
+- 2 implémenté tous les scans courants
+- un peu de refactoring
+- 1 lecture de la doc
+- 2 arp Ping pour découverte des hôtes
+- 2 netcat pour ouvrir des ports, marche plus ou moins
+- installé Metasploitable
+- 2 ajouté ports
+- 2 détection OS
+- 2 détection simples HTTP, SSH, FTP
+- 1 scan UDP, analyse de nmap UDP scan avec wireshark
+- recherches découverte d'hôtes
+- kernel renvoie auto RST lors scan SYN (car SYN/ACK non demandé)
+- scan TCP connect asynchrone
+- rapport affiché et enregistré
+- intégration détection OS
+- intégration détection services (configurations courantes)
+- testé option kernel arp_ignore (8: bloque ARP) et arp_accept
+- essayé d'implémenter SCTP ping
+- différencié actions privilégiées et non privilégiées (raw socket vs. socket)
+- nmap utilise ICMP echo ping si non ARP ping
+- choix de la technique de détection d'hotes
+- ajout de possibilités d'éxécution avec privilèges spécifiques (capability net_raw=ep)
+- divination de policy
+- amélioration du choix de technique de détection d'hote
+- broadcast ping inutile car flood et parfois ignoré
+
+### S2 ###
+
+- broadcast ping, le retour
+
+- Limites de scapy (pas thread-safe)
+	- mauvaise gestion du parallélisme
+		- fork + cPickle
+		- Pickle est limité dans ce qu'il peut sérialiser
+			- pas de closures, de méthodes
+		- terminaison du parallélisme
+			- sur Ctrl+C
+			- sur erreur
+		- buffers mal gérés? → erreur courante "[Errno 105] No buffer space available"
+	- bug si envoi ARP à soi-meme
+		
+- Postgresql
+	- create role littlescapy with login;
+	- grant all priviledges on database scandb to littlescapy;
+	
+- parallélisé + async SYN scan
+
+- recherches ports éphémères et ajouts ports
+
+- Recherches vacances février
+	- approfondi BGP (TCP/IP Guide)
+	- lu thèse cartographie réseau
+	- BDD en ligne routes BGP: RouteViews
+		- 53 FAI, assez complet et à jour
+		- accès public via route-views2.routeviews.org:23
+	- traceroute pour cartographier, mais comment connaitre plus d'un voisin?
+	- SNMP pour cartographier, mais limité aux utilisateurs de SNMP
