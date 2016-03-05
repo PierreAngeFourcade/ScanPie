@@ -22,6 +22,10 @@ def DEBUG(msg, *args):
 def STATUS(msg, *args): 
 	if VERBOSE == 2:
 		logger.info(timestamp() + " " + msg, *args)
+		
+def PEDANTIC(msg, *args): 
+	if VERBOSE == 2:
+		logger.info(msg, *args)
 	
 def INFO(msg, *args): 
 	if VERBOSE == 1:
