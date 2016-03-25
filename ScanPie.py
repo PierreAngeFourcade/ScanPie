@@ -148,21 +148,23 @@ def handlePorts(portStrings):
 	ports = []
 	for portString in portStrings:
 		if portString == "common":
-			ports.extend(COMMON_PORTS)
+			ports.extend(cfg.COMMON_PORTS)
 		elif portString == "very_common":
-			ports.extend(VERY_COMMON_PORTS)
+			ports.extend(cfg.VERY_COMMON_PORTS)
 		elif portString == "database":
-			ports.extend(DATABASE_PORTS)
+			ports.extend(cfg.DATABASE_PORTS)
 		elif portString == "email":
-			ports.extend(EMAIL_PORTS)
+			ports.extend(cfg.EMAIL_PORTS)
 		elif portString == "shared_service":
-			ports.extend(SHARED_SERVICE_PORTS)
+			ports.extend(cfg.SHARED_SERVICE_PORTS)
 		elif portString == "auth":
-			ports.extend(AUTH_PORTS)
+			ports.extend(cfg.AUTH_PORTS)
 		elif portString == "other":
-			ports.extend(OTHER_PORTS)
+			ports.extend(cfg.OTHER_PORTS)
 		elif portString == "voip":
-			ports.extend(VOIP_PORTS)
+			ports.extend(cfg.VOIP_PORTS)
+		elif portString == "http":
+			ports.extend(cfg.HTTP_PORTS + cfg.HTTPS_PORTS)
 		elif portString.find('-') != -1:
 			ports.extend(port_range(portString))
 		else:
@@ -285,7 +287,6 @@ def parallelScan2(scan, ips, ports, results): # one
 			queue.put((ip, port))
 	queue.join()
 	
-	#DEBUG('results: %s', results)
 	return results
 	
 def queuedScan2(scan, queue, results):
@@ -332,9 +333,9 @@ def syn2(ip, port, results, sock):
 	results[ip].append((port, etat, service, cve))
 	INFO('ip %s port %s %s %s', ip, port, etat, cve)
 	
-def parallel(func, poolSize, *inputs, **opts):
+def parallel(poolSize, func, input_, **opts):
 	
-	PEDANTIC('Opts: %s\nInputs: %s', opts, inputs)
+	PEDANTIC('Opts: %s\nInputs: %s', opts, input_)
 	inQueue, outQueue = Queue(), Queue()
 	
 	for i in range(poolSize):
@@ -342,8 +343,8 @@ def parallel(func, poolSize, *inputs, **opts):
 		worker.daemon = True
 		worker.start()
 	
-	for input_ in itertools.product(*inputs):
-		inQueue.put(input_)
+	for e in input_:
+		inQueue.put(e)
 	try:
 		inQueue.join()
 	except KeyboardInterrupt:
@@ -357,34 +358,36 @@ def parallel(func, poolSize, *inputs, **opts):
 	return res
 	
 def queued(func, inQueue, outQueue, opts):
+	kwargs = {}
 	if 'createSock' in opts:
-		sock = conf.L3socket(filter=None, iface=conf.iface, nofilter=1)
+		kwargs['sock'] = conf.L3socket(filter=None, iface=conf.iface, nofilter=1)
 	thisThread = threading.currentThread()
 	while True:
 		try:
 			#INFO('[%s]', thisThread.name)
-			param = inQueue.get()
-			res = func(*param, sock=sock)
+			args = inQueue.get()
+			res = func(*args, **kwargs)
 			if res is not None:
-				if 'associate' in opts: outQueue.put((param, res))
+				if 'associate' in opts: outQueue.put((args, res))
 				else: outQueue.put(res)
 		except IOError as e:
 			ERROR('%s', e); raise
 		finally:
 			inQueue.task_done()
 			
-def fingerprintOpenPort(openIpPort):
-	ip, port = openIpPort
+def fingerprintOpenPort(ip, port):
 	service = servFingerprinting(ip, port)
+	cve = ''
 	if service and not service.startswith('[') and service.count('/') > 0:
 		cveUrl, cveList = searchCVE(*service.split('/', 1))
+		INFO('CVE: %r %r', cveUrl, cveList)
 		cve = cveUrl
 		if cfg.VERBOSE:
-			cve += '\n' + ' '.join(cveList)
+			pass#cve += ' ' + ' '.join(cveList)
 	return service, cve
 			
 def syn3(ips, ports, results):
-	poolSize = int(len(ips)**.6)+1
+	poolSize = min(int(len(ips)**.5)+1, 20)
 	INFO("Pool size: %s", poolSize)
 	
 	def scan(ip, port, sock):
@@ -392,7 +395,7 @@ def syn3(ips, ports, results):
 		DEBUG('ip %s port %s (%s)', ip, port, 'res' if ans else 'nores')
 		return ans[0] if ans else (unans[0], None)
 	
-	answers = parallel(scan, poolSize, ips, ports, createSock=True)
+	answers = parallel(poolSize, scan, itertools.product(ips, ports), createSock=True)
 	
 	for req, res in answers:
 		etat, service, cve = '', '', ''
@@ -417,18 +420,19 @@ def syn3(ips, ports, results):
 			if results[reqIp.dst][0] == '':
 				results[reqIp.dst][0] = passiveOsDetection(res)
 			
-		results[reqIp.dst].append((req.getlayer(TCP).dport, etat, '', ''))
+		results[reqIp.dst].append([req.getlayer(TCP).dport, etat, '', ''])
 		INFO('ip %s port %s %s', reqIp.dst, req.getlayer(TCP).dport, etat)
 	
-	openPorts = [(k, v[0]) for k,v in results.iteritems() if v[1] == 'open']
-	DEBUG('Open ports: %s', openPorts)
+	openPorts = [(k, e[0]) for k,v in results.iteritems() for e in v[1:] if e[1] == 'open']
 	
-	fingerprints = parallel(fingerprintOpenPort, poolSize, openPorts, associate=True, createSock=True)
+	fingerprints = parallel(poolSize, fingerprintOpenPort, openPorts, associate=True)
 	
-	for param, res in fingerprints:
-		ip, port = param
+	for keys, res in fingerprints:
+		ip, port = keys
 		service, cve = res
-		results[ip][2:4] = [service, cve]
+		for scanLine in results[ip]:
+			if scanLine[0] == port:
+				scanLine[2:4] = [service, cve]
 
 	return results
 
@@ -681,7 +685,7 @@ def hostDiscovery(ipSpecs, dtype, privileged):
 
 	if 'arp' in dtype:
 		PRINT('Using ARP ping for host discovery')
-		ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ipSpecs),retry=0,timeout=2, inter=.0001, verbose=cfg.VERBOSE)
+		ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ipSpecs),retry=0,timeout=2, inter=.001, verbose=cfg.VERBOSE)
 		ips.extend(req.getlayer(ARP).pdst for req, res in ans if res.haslayer(ARP))
 		for _, res in ans:
 			if res.haslayer(ARP):
@@ -694,11 +698,11 @@ def hostDiscovery(ipSpecs, dtype, privileged):
 		ips.extend(icmpPingSweep(handleIps(ipSpecs, True, True)))
 	elif 'icmp' in dtype:
 		PRINT('Using ICMP echo/timestamp ping for host discovery')
-		ans, _ = sr(IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.00001, verbose=cfg.VERBOSE)
+		ans, _ = sr(IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.001, verbose=cfg.VERBOSE)
 		ips.extend(req.getlayer(IP).dst for req, res in ans if res.haslayer(IP))
 	elif 'icmp_broadcast' in dtype:
 		PRINT('Using ICMP echo/timestamp broadcast ping for host discovery')
-		ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff')/IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.00001, verbose=cfg.VERBOSE)
+		ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff')/IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.001, verbose=cfg.VERBOSE)
 		ips.extend(req.getlayer(IP).dst for req, res in ans if res.haslayer(IP))
 		
 	ips = sorted(set(ips))
@@ -721,24 +725,6 @@ def priviledgeLevel():
 			return 0
 		DEBUG('err raw: %s', errRaw)
 	raise RuntimeError('wtf?')
-
-# Server ports
-# 1-1023: well-known, 1024-49151: vendor registered, 49152-65535: dynamic/private
-VERY_COMMON_PORTS = [21, 22, 23, 53, 80, 443, 1027, 8000, 8080, 8433] # FTP, SSH, Telnet, DNS, HTTP, HTTPS, IIS, HTTP Proxy, HTTP-alt, HTTPS-alt
-OTHER_COMMON_PORTS = [81, 990, 3128, 8008, 8009, 8081, 8888, 32768, 32769] # HOSTS2, FTPS, Squid proxy, IBM HTTP, Apache JServ, various HTTP, Sun HTTP, IBM Filenet
-DATABASE_PORTS = [1433, 1434, 1521, 1528, 2483, 2484, 3050, 3306, 5432] # MySQL, PostgreSQL, MSSQL, Oracle
-EMAIL_PORTS = [25, 110, 143, 465, 587, 993, 995, 2525] # SMTP, POP3, IMAP, SMTPS, SMTP-alt, IMAPS, POPS, SMTP-alt
-SHARED_SERVICE_PORTS = [111, 135, 137, 139, 445, 515, 548, 631, 873, 1025, 2049, 5357] # RPC bind, MSRPC, SMB, UNIX Printing, AFP/IP, CUPS, rsync, NFS or IIS, NFS, WSD-api
-OTHER_COMMON2_PORTS = [1, 199, 512, 513, 514, 1723, 1900, 5000, 6000, 6001, 6002] # tcpmux, SNMP mux, exec, login, shell, PPTP, UPNP, X11
-AUTH_PORTS = [88, 389, 464, 543, 544, 636, 2105, 3268, 3269] # Kerberos, LDAP
-REMOTE_ADMIN_PORTS = [625, 3389, 5631, 5800, 5900] # Apple Xserver admin, MS RDP, pcanywhere-data, VNC HTTP, VNC
-ROUTING_PORTS = [161, 162, 179, 1993, 1998, 2000] # SNMP, BGP, Cisco SNMP TCP, Cisco X.25 service, Cisco SCCP
-VOIP_PORTS = [5060, 5061] # SIP, SIP-TLS
-COMMON_PORTS = VERY_COMMON_PORTS + OTHER_COMMON_PORTS + SHARED_SERVICE_PORTS \
-	 + EMAIL_PORTS + DATABASE_PORTS
-ALL_COMMON_PORTS = COMMON_PORTS + AUTH_PORTS + OTHER_COMMON2_PORTS + REMOTE_ADMIN_PORTS + ROUTING_PORTS + VOIP_PORTS
-# Client ports
-# 49152-65535 (Windows/BSD), 32768-61000 (Linux >= 2.4), 1024-4999 (Linux < 2.4)
 
 if __name__ == "__main__":
 
@@ -799,9 +785,9 @@ if __name__ == "__main__":
 			if options.scantype == "c" or privileged < 2:
 				results = tcp_connect(ips, ports, results)
 			elif options.scantype == "s":
-				results = tcp_syn(ips, ports, results)
+				#results = tcp_syn(ips, ports, results)
 				#results = parallelScan2(syn2, ips, ports, results)
-				#results = syn3(ips, ports, results)
+				results = syn3(ips, ports, results)
 			elif options.scantype == "x":
 				results = tcp_xmas(ips, port)
 			elif options.scantype == "n":

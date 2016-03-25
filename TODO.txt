@@ -6,7 +6,7 @@ Découverte hotes:
 En plus des ping ICMP echo et ARP
 - SYN et SYN+ACK, pour les pare-feu stateful
 - ACK, pour les pare-feu stateless
-- ICMP «timestamp», «information» et «adress mask», types 13, 15 et 17
+- ICMP «timestamp», «information» et «adress mask» (routeurs), types 13, 15 et 17
 - SCTP ping
 - IP Proto (pas utile à priori)
 
