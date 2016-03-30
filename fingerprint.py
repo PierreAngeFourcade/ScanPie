@@ -144,7 +144,7 @@ def passiveOsDetection(packet):
 		os = "Windows"
 		if packet.haslayer(TCP):
 			if int(packet.getlayer(TCP).window) == 8192:
-				os = "Windows 7"
+				os = "Windows Vista,7,8"
 			elif int(packet.getlayer(TCP).window) == 65535:
 				os = "Windows XP"
 	elif int(packet.getlayer(IP).ttl) == 64:

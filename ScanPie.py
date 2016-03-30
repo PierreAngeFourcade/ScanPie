@@ -25,9 +25,37 @@ from scapy.all import *
 import cfg
 from cfg import PRINT, ERROR, WARN, INFO, PEDANTIC, STATUS, DEBUG
 from fingerprint import *
+import visualization
 
 
 class ScanResults(OrderedDict):
+	
+	def __init__(self, dict_):
+		OrderedDict.__init__(self, dict_)
+		self.osByIp = {}
+
+	@classmethod
+	def create(klass, ips, ports):
+		return klass({ip: {port: {} for port in sorted(ports)} for ip in sorted(ips)})
+		
+	def __str__(self):
+		return OrderedDict.__str__(self) + str(self.osByIp)
+		
+	def yamlRepr(self):
+		out = []
+		for ip in self:
+			out.append('{}:'.format(ip))
+			out.append('  OS: {}'.format(self.getOS(ip)))
+			for port in self[ip]:
+				scanLine = ', '.join('{} {}'.format(k,v) for k,v in self[ip][port].iteritems() if v)
+				out.append('  {}: {}'.format(port, scanLine))
+		return '\n'.join(out)
+		
+	def getOS(self, ip):
+		return self.osByIp.get(ip, '')
+		
+	def setOS(self, ip, os):
+		self.osByIp[ip] = os
 	
 	def add(self, key, val):
 		if not key in self:
@@ -383,11 +411,11 @@ def fingerprintOpenPort(ip, port):
 		INFO('CVE: %r %r', cveUrl, cveList)
 		cve = cveUrl
 		if cfg.VERBOSE:
-			pass#cve += ' ' + ' '.join(cveList)
+			cve += ' ' + ' '.join(cveList)
 	return service, cve
 			
 def syn3(ips, ports, results):
-	poolSize = min(int(len(ips)**.5)+1, 20)
+	poolSize = min(int(len(ips)**.5)+2, 20)
 	INFO("Pool size: %s", poolSize)
 	
 	def scan(ip, port, sock):
@@ -399,7 +427,7 @@ def syn3(ips, ports, results):
 	
 	for req, res in answers:
 		etat, service, cve = '', '', ''
-		reqIp = req.getlayer(IP)
+		ip = req.getlayer(IP).dst
 		
 		if res == None:
 			etat = 'nores'
@@ -417,23 +445,25 @@ def syn3(ips, ports, results):
 				if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
 					etat = 'filtered'
 			
-			if results[reqIp.dst][0] == '':
-				results[reqIp.dst][0] = passiveOsDetection(res)
+			if results.getOS(ip) == '':
+				results.setOS(ip, passiveOsDetection(res))
 			
-		results[reqIp.dst].append([req.getlayer(TCP).dport, etat, '', ''])
-		INFO('ip %s port %s %s', reqIp.dst, req.getlayer(TCP).dport, etat)
+		results[ip][req.getlayer(TCP).dport]['etat'] = etat
+		#INFO('ip %s port %s %s', ip, req.getlayer(TCP).dport, etat)
 	
-	openPorts = [(k, e[0]) for k,v in results.iteritems() for e in v[1:] if e[1] == 'open']
+	openPorts = [(ip, port) for ip in results for port in results[ip] if results[ip][port]['etat'] == 'open']
+	DEBUG('Open ports: %s', openPorts)
 	
 	fingerprints = parallel(poolSize, fingerprintOpenPort, openPorts, associate=True)
 	
 	for keys, res in fingerprints:
 		ip, port = keys
 		service, cve = res
-		for scanLine in results[ip]:
-			if scanLine[0] == port:
-				scanLine[2:4] = [service, cve]
-
+		for port_ in results[ip]:
+			if port_ == port:
+				results[ip][port]['service'] = service
+				results[ip][port]['cve'] = cve
+	
 	return results
 
 def tcp_syn(ips, ports, results):
@@ -678,32 +708,45 @@ def hostDiscovery(ipSpecs, dtype, privileged):
 	
 	if privileged == 2:
 		if dtype == 'best':
-			if isLan: dtype = ['arp', 'icmp_broadcast']
-			else: dtype = ['icmp']
+			if isLan: dtype = ['arp', 'icmp_broadcast', 'syn']
+			else: dtype = ['icmp', 'syn']
 		elif 'icmp' in dtype and isLan: dtype = ['arp', 'icmp_broadcast']
 	elif privileged == 1: dtype = ['icmp_lowpriv']
 
+	if 'syn' in dtype:
+		PRINT('Using TCP SYN ping for host discovery')
+		ans, _ = sr(IP(dst=ipSpecs)/TCP(sport=80, dport=[80,445]),timeout=1, inter=.0005, verbose=cfg.VERBOSE)
+		discovered = [req.getlayer(IP).dst for req, res in ans if res.haslayer(IP)]
+		ips.extend(discovered)
+		INFO('\ndiscovered ips: %s\n', discovered)
 	if 'arp' in dtype:
 		PRINT('Using ARP ping for host discovery')
 		ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ipSpecs),retry=0,timeout=2, inter=.001, verbose=cfg.VERBOSE)
-		ips.extend(req.getlayer(ARP).pdst for req, res in ans if res.haslayer(ARP))
+		discovered = [req.getlayer(ARP).pdst for req, res in ans if res.haslayer(ARP)]
+		ips.extend(discovered)
 		for _, res in ans:
 			if res.haslayer(ARP):
 				conf.netcache.arp_cache[res[ARP].psrc] = res[ARP].hwsrc
 		INFO("\narp cache:\n%s", conf.netcache.arp_cache)
-		INFO('\nips: %s\n', ips)
+		INFO('\ndiscovered ips: %s\n', discovered)
 		
 	if 'icmp_lowpriv' in dtype:
 		PRINT('Using ICMP echo ping for host discovery')
-		ips.extend(icmpPingSweep(handleIps(ipSpecs, True, True)))
+		discovered = [icmpPingSweep(handleIps(ipSpecs, True, True))]
+		ips.extend(discovered)
+		INFO('\ndiscovered ips: %s\n', discovered)
 	elif 'icmp' in dtype:
 		PRINT('Using ICMP echo/timestamp ping for host discovery')
 		ans, _ = sr(IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.001, verbose=cfg.VERBOSE)
-		ips.extend(req.getlayer(IP).dst for req, res in ans if res.haslayer(IP))
+		discovered = [req.getlayer(IP).dst for req, res in ans if res.haslayer(IP)]
+		ips.extend(discovered)
+		INFO('\ndiscovered ips: %s\n', discovered)
 	elif 'icmp_broadcast' in dtype:
 		PRINT('Using ICMP echo/timestamp broadcast ping for host discovery')
 		ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff')/IP(dst=ipSpecs)/ICMP(type=[8,13]),timeout=2, inter=.001, verbose=cfg.VERBOSE)
-		ips.extend(req.getlayer(IP).dst for req, res in ans if res.haslayer(IP))
+		discovered = [req.getlayer(IP).dst for req, res in ans if res.haslayer(IP)]
+		ips.extend(discovered)
+		INFO('\ndiscovered ips: %s\n', discovered)
 		
 	ips = sorted(set(ips))
 	PRINT('%s hosts discovered: %s', len(ips), ','.join(ips) or 'none')
@@ -725,6 +768,27 @@ def priviledgeLevel():
 			return 0
 		DEBUG('err raw: %s', errRaw)
 	raise RuntimeError('wtf?')
+
+def generateReport(results):
+	out = []
+	for ip in results: 
+		# Sort port results
+		
+		# Compute likely policy
+		policy = 'closed'
+		if any(results[ip][port]['etat'] == 'filtered' for port in results[ip]):
+			policy = 'filtered'
+			
+		# Generate output
+		out.append('\nip: ' + ip)
+		out.append('passive OS detection: ' + (results.getOS(ip) or 'unknown'))
+		out.append('likely policy: ' + (policy or 'unknown'))
+		out.append('ports: {} open'.format(sum(1 for portRes in results[ip].itervalues() if portRes['etat'] == 'open')))
+		for port, portRes in results[ip].iteritems():
+			etat = portRes['etat']
+			if etat != 'nores' and etat != policy:
+				out.append(' '.join([str(port), etat or 'unknown', toService(port, portRes['service']), portRes['cve']]))
+	return out
 
 if __name__ == "__main__":
 
@@ -759,7 +823,7 @@ if __name__ == "__main__":
 		conf.ipv6_enabled = False
 		outFile = options.output
 		
-		# Check for priviledge level
+		# Check priviledge level
 		privileged = priviledgeLevel()
 		INFO('Priviledge level: %s', privileged)
 		if privileged == 0: exit()
@@ -778,7 +842,7 @@ if __name__ == "__main__":
 		if not options.forceScan and not ips and all(isPrivate(ipSpec) for ipSpec in ipSpecs): exit()
 		
 		# Create a structure to store results
-		results = ScanResults((ip, ['']) for ip in sorted(ips))
+		results = ScanResults.create(ips, ports)
 		
 		if ips:
 			# Launch scan
@@ -797,23 +861,9 @@ if __name__ == "__main__":
 			elif options.scantype == "u":
 				results = udp(ips, ports, results)
 			else: exit()
-
-		out = []
-		for resultIP, resultData in results.items():
-			# Sort port results
-			resultData[1:] = sorted(resultData[1:])
-			
-			# Compute likely policy
-			policy = 'closed'
-			if len(resultData) > 0 and any(e[1] == 'filtered' for e in resultData[1:]):
-				policy = 'filtered'
-				
-			# Generate output
-			out.append('\nip: ' + resultIP + "\nOS: " + (resultData[0] or 'unknown') + "\nlikely policy: " + (policy or 'unknown') + '\nports: {} open'.format(sum(1 for _, etat, _, _ in resultData[1:] if etat == 'open')))
-			for dstPort, etat, service, cve in resultData[1:]:
-				if etat != 'nores' and etat != policy:
-					out.append(' '.join([str(dstPort), etat or 'unknown', toService(dstPort, service), cve]))
+		DEBUG('Results:\n%s', results.yamlRepr())
 		
+		out = generateReport(results)
 		PRINT('''
 +--------------------------------------------+
 |  Report                                    |
@@ -824,3 +874,5 @@ if __name__ == "__main__":
 				dumpFile.write(strftime("%d %b %Y %H:%M:%S") + '\n')
 				dumpFile.write(('#' if privileged else '$') + ' python ' + ' '.join(argv))
 				dumpFile.write('\n'.join(out) + '\n---\n')
+		
+		visualization.drawAndExport(visualization.toGraph(results))
