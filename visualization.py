@@ -19,7 +19,7 @@ def toGraph(results):
 		graph.add_node(ip, color='#FFFFFF')
 		graph.add_edge(ownIp, ip)
 		for port, portRes in ipRes.iteritems():
-			graph.add_node(port, color=COLORS_ETAT[portRes['etat']])
+			graph.add_node(port, color=COLORS_ETAT.get(portRes['etat'], '#000000'))
 			#if portRes['etat'] == 'open':
 			graph.add_edge(ip, port)
 			#graph[ip][port]['color'] = COLORS_ETAT[portRes['etat']]

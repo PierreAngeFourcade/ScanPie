@@ -233,133 +233,6 @@ def tcp_connect(ips, ports, results):
 	pool.close()
 	pool.join()
 	return results
-
-def queuedScan(scan, queue, ports, results):
-	while True:
-		ip = queue.get()
-		try:
-			res = scan(ip, ports)
-			results[ip] = res
-		except IOError as e:
-			ERROR('%s', e); raise
-		finally:
-			queue.task_done()
-
-def parallelScan(scan, ips, ports, results):
-
-	poolSize = min(len(ips), 256)
-	INFO("Pool size: %s", poolSize)
-	queue = Queue()
-	
-	for i in range(poolSize):
-		worker = Thread(target=queuedScan, args=(scan, queue, ports, results))
-		worker.daemon = True
-		worker.start()
-	
-	for ip in ips:
-		queue.put(ip)
-	queue.join()
-	
-	return results
-
-def syn(ip, ports):
-	result = ['']
-	ans, _ = sr(IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), \
-	inter=.1, retry=1, timeout=5, verbose=(cfg.VERBOSE==2))
-		
-	for req, res in ans:
-		etat, service, cve = '', '', ''
-		if res == None:
-			etat = 'nores'
-		else:
-			reqIp = req.getlayer(IP)
-			if(res.haslayer(TCP)):
-				resTcp = res.getlayer(TCP)
-				if(resTcp.flags == 0x12):
-					# Kernel send RST to end connection
-					etat = 'open'
-					service = servFingerprinting(reqIp.dst, resTcp.sport)
-					if service and not service.startswith('[') and service.count('/') > 0:
-						cve = ' '.join(searchCVE(*service.split('/', 1)))
-				elif (resTcp.flags == 0x14):
-					etat = 'closed'
-				else:
-					INFO('Weird packet: %s', res.summary())
-			elif(res.haslayer(ICMP)):
-				if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
-					etat = 'filtered'
-
-			if result[0] == '':
-				result[0] = passiveOsDetection(res)
-
-		result.append((req.getlayer(TCP).dport, etat, service, cve))
-		INFO('ip %s port %s %s %s', reqIp.dst, req.getlayer(TCP).dport, etat, cve)
-		
-	return result
-	
-def parallelScan2(scan, ips, ports, results): # one 
-
-	poolSize = min(len(ips), 256)
-	INFO("Pool size: %s", poolSize)
-	queue = Queue()
-	
-	workers = []
-	for i in range(poolSize):
-		worker = Thread(target=queuedScan2, args=(scan, queue, results))
-		worker.daemon = True
-		worker.start()
-		workers.append(worker)
-	
-	for port in ports:
-		for ip in ips:
-			queue.put((ip, port))
-	queue.join()
-	
-	return results
-	
-def queuedScan2(scan, queue, results):
-	sock = conf.L3socket(filter=None, iface=conf.iface, nofilter=1)
-	while True:
-		ip, port = queue.get()
-		try:
-			scan(ip, port, results, sock)
-		except IOError as e:
-			ERROR('%s', e); raise
-		finally:
-			queue.task_done()
-
-def syn2(ip, port, results, sock):
-	ans, _ = sndrcv(sock, IP(dst=ip)/TCP(sport=80,dport=port,flags="S"), timeout=2, retry=1, verbose=(cfg.VERBOSE==2))
-	res = ans[0][1] if len(ans) else None
-	
-	etat, service, cve = '', '', ''
-	if res == None:
-		etat = 'nores'
-	else:
-		if(res.haslayer(TCP)):
-			resTcp = res.getlayer(TCP)
-			if(resTcp.flags == 0x12):
-				# Kernel send RST to end connection
-				etat = 'open'
-				service = servFingerprinting(ip, port)
-				if service and not service.startswith('[') and service.count('/') > 0:
-					cveUrl, cveList = searchCVE(*service.split('/', 1))
-					cve = cveUrl
-					if cfg.VERBOSE:
-						cve += '\n' + ' '.join(cveList)
-			elif (resTcp.flags == 0x14):
-				etat = 'closed'
-			else:
-				INFO('Weird packet: %s', res.summary())
-		elif(res.haslayer(ICMP)):
-			if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
-				etat = 'filtered'
-
-		if results[ip][0] == '':
-			results[ip][0] = passiveOsDetection(res)
-
-	results[ip].append((port, etat, service, cve))
-	INFO('ip %s port %s %s %s', ip, port, etat, cve)
 	
 def parallel(poolSize, func, input_, **opts):
 	
@@ -403,6 +276,45 @@ def queued(func, inQueue, outQueue, opts):
 		finally:
 			inQueue.task_done()
 			
+def scan(scanType, ips, ports, results):
+	poolSize = min(int(len(ips)**.5)+2, 20)
+	INFO("Pool size: %s", poolSize)
+	
+	# Probe ports of every ips
+	if scanType in 'saxnf':
+		if scanType == 'n': flags = ''
+		elif scanType == 'x': flags = 'UAPRSF'
+		else: flags = scanType
+		def probe(ip, port, sock):
+			return tcpProbe(flags.upper(), ip, port, sock)
+	elif scanType == 'u': probe = udpProbe
+	else: return
+	
+	answers = parallel(poolSize, probe, itertools.product(ips, ports), createSock=True)
+	
+	# Interpret probe responses
+	if scanType == 's': synInterpret(answers, results)
+	elif scanType == 'a': ackInterpret(answers, results)
+	elif scanType in 'xnf': nullXmasFinInterpret(answers, results)
+	elif scanType == 'u': udpInterpret(answers, results)
+	
+	# Collect open ports
+	openPorts = [(ip, port) for ip in results for port in results[ip] if results[ip][port]['etat'] == 'open']
+	DEBUG('Open ports: %s', openPorts)
+	
+	# Fingerprint services and find CVE
+	fingerprints = parallel(poolSize, fingerprintOpenPort, openPorts, associate=True)
+	
+	for keys, res in fingerprints:
+		ip, port = keys
+		service, cve = res
+		for port_ in results[ip]:
+			if port_ == port:
+				results[ip][port]['service'] = service
+				results[ip][port]['cve'] = cve
+	
+	return results
+
 def fingerprintOpenPort(ip, port):
 	service = servFingerprinting(ip, port)
 	cve = ''
@@ -413,20 +325,20 @@ def fingerprintOpenPort(ip, port):
 		if cfg.VERBOSE:
 			cve += ' ' + ' '.join(cveList)
 	return service, cve
-			
-def syn3(ips, ports, results):
-	poolSize = min(int(len(ips)**.5)+2, 20)
-	INFO("Pool size: %s", poolSize)
 	
-	def scan(ip, port, sock):
-		ans, unans = sndrcv(sock, IP(dst=ip)/TCP(sport=80,dport=port,flags="S"), timeout=2, retry=-1, verbose=(cfg.VERBOSE==2))
-		DEBUG('ip %s port %s (%s)', ip, port, 'res' if ans else 'nores')
-		return ans[0] if ans else (unans[0], None)
+def tcpProbe(probeType, ip, port, sock):
+	ans, unans = sndrcv(sock, IP(dst=ip)/TCP(sport=80,dport=port,flags=probeType), timeout=2, retry=-1, verbose=(cfg.VERBOSE==2))
+	DEBUG('ip %s port %s (%s)', ip, port, 'res' if ans else 'nores')
+	return ans[0] if ans else (unans[0], None)
 	
-	answers = parallel(poolSize, scan, itertools.product(ips, ports), createSock=True)
+def udpProbe(ip, port, sock):
+	ans, unans = sndrcv(sock, IP(dst=dstIp)/UDP(dport=dstPort)/DNS(rd=1,qd=DNSQR(qname="www.google.com")), timeout=2, retry=2, verbose=(cfg.VERBOSE==2))
+	DEBUG('ip %s port %s (%s)', ip, port, 'res' if ans else 'nores')
+	return ans[0] if ans else (unans[0], None)
 	
+def synInterpret(answers, results):
 	for req, res in answers:
-		etat, service, cve = '', '', ''
+		etat = ''
 		ip = req.getlayer(IP).dst
 		
 		if res == None:
@@ -448,235 +360,56 @@ def syn3(ips, ports, results):
 			if results.getOS(ip) == '':
 				results.setOS(ip, passiveOsDetection(res))
 			
-		results[ip][req.getlayer(TCP).dport]['etat'] = etat
 		#INFO('ip %s port %s %s', ip, req.getlayer(TCP).dport, etat)
-	
-	openPorts = [(ip, port) for ip in results for port in results[ip] if results[ip][port]['etat'] == 'open']
-	DEBUG('Open ports: %s', openPorts)
-	
-	fingerprints = parallel(poolSize, fingerprintOpenPort, openPorts, associate=True)
-	
-	for keys, res in fingerprints:
-		ip, port = keys
-		service, cve = res
-		for port_ in results[ip]:
-			if port_ == port:
-				results[ip][port]['service'] = service
-				results[ip][port]['cve'] = cve
-	
-	return results
-
-def tcp_syn(ips, ports, results):
-	PRINT("\nRéalisation d'un scan TCP SYN\n")
-	
-	srcPort = 80#RandShort()
-	try:
-		ans, _ = sr(IP(dst=ips)/TCP(sport=srcPort,dport=ports,flags="S"),
-			timeout=2, retry=1, inter=.1, verbose=(cfg.VERBOSE==2))
+		results[ip][req.getlayer(TCP).dport] = {'etat': etat, 'service': '', 'cve': ''}
 		
-		for req, res in ans:
-			etat, service = '', ''
-			if res == None:
-				etat = 'nores'
-			else:
-				reqIp = req.getlayer(IP)
-				if(res.haslayer(TCP)):
-					resTcp = res.getlayer(TCP)
-					if(resTcp.flags == 0x12):
-						# Kernel send RST to end connection
-						etat = 'open'
-						service = servFingerprinting(reqIp.dst, resTcp.sport)
-					elif (resTcp.flags == 0x14):
-						etat = 'closed'
-					else:
-						INFO('Weird packet: %s', res.summary())
-				elif(res.haslayer(ICMP)):
-					if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
-						etat = 'filtered'
 
-				if results[reqIp.dst][0] == '':
-					results[reqIp.dst][0] = passiveOsDetection(res)
+def nullXmasFinInterpret(answers, results):
+	for req, res in answers:
+		etat = ''
+		ip = req.getlayer(IP).dst
+		
+		if res == None:
+			etat = 'nores/open'
+		else:
+			if(res.haslayer(TCP)):
+				resTcp = res.getlayer(TCP)
+				if (resTcp.flags & 0x04):
+					etat = 'closed'
+				else:
+					INFO('Weird packet: %s', res.summary())
+			elif(res.haslayer(ICMP)):
+				if(int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]):
+					etat = 'filtered'
+			
+			if results.getOS(ip) == '':
+				results.setOS(ip, passiveOsDetection(res))
 
-			results[reqIp.dst].append((req.getlayer(TCP).dport, etat, service, ''))
-			INFO('ip %s port %s %s', reqIp.dst, req.getlayer(TCP).dport, etat)
+		#INFO('ip %s port %s %s', ip, req.getlayer(TCP).dport, etat)			
+		results[ip][req.getlayer(TCP).dport] = {'etat': etat, 'service': '', 'cve': ''}
 
-	except IOError as e:
-		ERROR('%s', e)
+def udpInterpret(answers, results):
+	for req, res in answers:
+		etat = ''
+		ip = req.getlayer(IP).dst
+		
+		if res == None:
+			etat = 'nores'
+		else:
+			if res.haslayer(UDP):
+				etat = 'open'
+			elif res.haslayer(ICMP):
+				if int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) == 3:
+					etat = 'closed'
+				if int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,9,10,13]:
+					etat = 'filtered'
+			
+			if results.getOS(ip) == '':
+				results.setOS(ip, passiveOsDetection(res))
+			
+		#INFO('ip %s port %s %s', ip, req.getlayer(TCP).dport, etat)
+		results[ip][req.getlayer(TCP).dport] = {'etat': etat, 'service': '', 'cve': ''}
 
-	return results
-
-def tcp_syn2(ips, ports, results):
-	PRINT("\nRéalisation d'un scan TCP SYN\n")
-	
-	def scan(queue, lock, results, ports):
-		sock = conf.L3socket(filter=None, iface=conf.iface, nofilter=1)
-		try:
-			while True:
-				ip = queue.get()
-				try:
-					ans, _ = sndrcv(sock, IP(dst=ip)/TCP(sport=80,dport=ports,flags="S"), \
-					timeout=2, inter=.1, retry=1, verbose=(cfg.VERBOSE==2))
-					
-					for req, res in ans:
-						etat, service = '', ''
-						if res == None:
-							etat = 'nores'
-						else:
-							#ip = res.getlayer(IP).src
-							port = req.getlayer(TCP).dport
-							
-							if res.haslayer(TCP):
-								resTcp = res.getlayer(TCP)
-								if resTcp.flags == 0x12:
-									# Kernel send RST to end connection
-									etat = 'open'
-									service = servFingerprinting(ip, port)
-								elif resTcp.flags == 0x14:
-									etat = 'closed'
-								else:
-									INFO('Weird packet: %s', res.summary())
-							elif res.haslayer(ICMP):
-								if int(res.getlayer(ICMP).type) == 3 and int(res.getlayer(ICMP).code) in [0,1,2,3,9,10,13]:
-									etat = 'filtered'
-
-							if results[ip][0] == '':
-								results[ip][0] = passiveOsDetection(res)
-
-						with lock:
-							results[ip].append((port, etat, service, ''))
-						INFO('ip %s port %s %s', ip, port, etat)
-
-				except IOError as e:
-					ERROR('%s', e); raise
-				finally:
-					queue.task_done()
-		finally:
-			sock.close()
-
-	upper, lower = max(len(ips), len(ports)), min(len(ports), len(ips))
-	poolSize = min(len(ips), 256)#min(upper * min(4, lower), 1024)
-	INFO("Pool size: %s", poolSize)
-	queue = Queue()
-	lock = Lock()
-	
-	for i in range(poolSize):
-		worker = Thread(target=scan, args=(queue, lock, results, ports))
-		worker.daemon = True
-		worker.start()
-	
-	for ip in ips:
-		queue.put((ip))
-	queue.join()
-	
-	return results
-
-def tcp_xmas(ips, port):
-	PRINT("\nRéalisation d'un scan TCP Xmas\n")
-	try:
-		dstIp = ips
-		srcPort = random.randint(1, 65535)#RandShort()
-		dstPort = port
-
-		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,gflags="FPU"),timeout=5, verbose=cfg.VERBOSE)
-		if packet == None:
-			etat=1
-			dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-		elif(tcp_connect_scan_resp.haslayer(TCP)):
-			if(tcp_connect_scan_resp.getlayer(TCP).flags == 0x14):
-				etat=0
-				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-		elif(packet.haslayer(ICMP)):
-			if(int(packet.getlayer(ICMP).type)==3 and int(packet.getlayer(ICMP).code) in [1,2,3,9,10,13]):
-				etat="F"
-				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-
-	except IOError as e:
-		ERROR('%s', e)
-
-def tcp_fin(ips, port):
-	PRINT("\nRéalisation d'un scan FIN\n")
-	try:
-		dstIp = ips
-		srcPort = random.randint(1,65535)
-		dstPort = port
-
-		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,flags="F"),timeout=1, verbose=cfg.VERBOSE)
-		if packet == None:
-			etat=1
-			dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-
-		elif(packet.haslayer(TCP)):
-			if(packet.getlayer(TCP).flags == 0x14):
-				petat=0
-				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-
-		elif(packet.haslayer(ICMP)):
-			if(int(packet.getlayer(ICMP).type)==3 and int(packet.getlayer(ICMP).code) in [1,2,3,9,10,13]):
-				etat="F"
-				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-
-	except IOError as e:
-		ERROR('%s', e)
-
-def tcp_null(ips, port):
-	PRINT("\nRéalisation d'un scan NULL\n")
-	try:
-		dstIp = ips
-		srcPort = random.randint(1,65535)
-		dstPort = port
-
-		packet = sr1(IP(dst=dstIp)/TCP(dport=dstPort,flags=""),timeout=1, verbose=cfg.VERBOSE)
-		if packet == None:
-			etat=1
-			dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-		elif(packet.haslayer(TCP)):
-			if(packet.getlayer(TCP).flags == 0x14):
-				etat=0
-				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-		elif(packet.haslayer(ICMP)):
-			if(int(packet.getlayer(ICMP).type)==3 and int(packet.getlayer(ICMP).code) in [1,2,3,9,10,13]):
-				etat="F"
-				dumpFile.write(str(dstIp) + " , " + str(dstPort) + " , " + str(etat)+"\n")
-
-	except IOError as e:
-		ERROR('%s', e)
-
-def udp(ips, ports, results):
-	PRINT("\nRéalisation d'un scan UDP\n")
-	try:
-		srcPort = RandShort()
-		for dstPort in ports:
-			os, server = '', ''
-			for dstIp in ips:
-				packet1 = sr1(IP(dst=dstIp)/UDP(dport=dstPort),timeout=2, verbose=0)
-				if packet1 == None:
-					packet2 = sr1(IP(dst=dstIp)/UDP(dport=dstPort),timeout=2, verbose=0)
-					if packet2 == None:
-						etat = "Open|Filtered"
-					elif packet2.haslayer(ICMP):
-						if int(packet2.getlayer(ICMP).type) == 3 and int(packet2.getlayer(ICMP).code) == 3:
-							etat = "Closed"
-						elif(int(packet2.getlayer(ICMP).type) == 3 and int(packet2.getlayer(ICMP).code) in [0,1,2,9,10,13]):
-							etat = "Filtered"
-				elif packet1.haslayer(ICMP):
-					if int(packet1.getlayer(ICMP).type) == 3 and int(packet1.getlayer(ICMP).code) == 3:
-						etat = "Closed"
-					elif(int(packet1.getlayer(ICMP).type) == 3 and int(packet1.getlayer(ICMP).code) in [0,1,2,9,10,13]):
-						etat = "Filtered"
-				if packet1 != None:
-					os = passiveOsDetection(packet1)
-				elif packet2 != None:
-					os = passiveOsDetection(packet2)
-				if etat == "Open|Filtered" or "Filtered":
-					service = servFingerprinting(dstIp, dstPort)
-
-				results[dstIp].append((dstPort, etat, service))
-				INFO('ip %s port %s %s', dstIp, dstPort, etat)
-
-	except IOError as e:
-		ERROR('%s', e)
-
-	return results
 	
 def icmpPingSweep(ips):
 	
@@ -848,19 +581,9 @@ if __name__ == "__main__":
 			# Launch scan
 			if options.scantype == "c" or privileged < 2:
 				results = tcp_connect(ips, ports, results)
-			elif options.scantype == "s":
-				#results = tcp_syn(ips, ports, results)
-				#results = parallelScan2(syn2, ips, ports, results)
-				results = syn3(ips, ports, results)
-			elif options.scantype == "x":
-				results = tcp_xmas(ips, port)
-			elif options.scantype == "n":
-				results = tcp_null(ips, port)
-			elif options.scantype == "f":
-				results = tcp_fin(ips, port)
-			elif options.scantype == "u":
-				results = udp(ips, ports, results)
-			else: exit()
+			else:
+				results = scan(options.scantype, ips, ports, results)
+
 		DEBUG('Results:\n%s', results.yamlRepr())
 		
 		out = generateReport(results)
